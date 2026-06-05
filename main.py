@@ -25,7 +25,7 @@ hours = None
 for line in data:
     if line[4] == key:
         hours = line[7]
-        print(f"Activity {key} is worth {line[7]} hours.")
+        print(f"Activity {key} is worth {hours} hours.")
         found = True
         break
 
@@ -35,10 +35,9 @@ if not found:
 # Updating Jira fields
 
 JIRA_BASE_URL = "https://tt-rtx-26.atlassian.net"
-JIRA_EMAIL    = "matthewhoang0422@gmail.com"
+JIRA_EMAIL = os.getenv("EMAIL")
 JIRA_API_TOKEN = os.getenv("API_KEY")
-EPIC_KEY      = "KAN-5"
-
+EPIC_KEY = "KAN-5"
 ACTUAL_HOURS_FIELD = "customfield_10104"
 
 def update_epic_hours(epic_key, value):
