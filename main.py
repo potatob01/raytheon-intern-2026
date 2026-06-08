@@ -1,9 +1,13 @@
+import os
+import csv
+
 import requests
 from requests.auth import HTTPBasicAuth
-import os
 from dotenv import load_dotenv
 
-load_dotenv()
+NETWORK_ACTIVITY_COLUMN = 4
+HOURS_COLUMN = 7
+HEADER_ROW_COUNT = 2
 
 
 class CSVLoader:
@@ -15,19 +19,16 @@ class CSVLoader:
 
     def load(self) -> list:
         """Reads the CSV file and returns its contents as a 2D list."""
-        with open(self.filepath, "r") as file:
-            file.readline()  # Skip first header row
-            file.readline()  # Skip second header row
-            for line in file:
-                self.data.append(line.strip().split(","))
+        with open(self.filepath, "r", newline="") as file:
+            reader = csv.reader(file)
+            for _ in range(HEADER_ROW_COUNT):
+                next(reader, None)
+            self.data = [row for row in reader]
         return self.data
 
 
 class ActivityFinder:
     """Searches parsed CSV data for a network activity by name."""
-
-    NAME_COL = 4   # Column index for activity name
-    HOURS_COL = 7  # Column index for hours value
 
     def __init__(self, data: list):
         self.data = data
@@ -35,8 +36,8 @@ class ActivityFinder:
     def find(self, key: str) -> str | None:
         """Returns the hours for the given activity name, or None if not found."""
         for line in self.data:
-            if line[self.NAME_COL] == key:
-                return line[self.HOURS_COL]
+            if line[NETWORK_ACTIVITY_COLUMN] == key:
+                return line[HOURS_COLUMN]
         return None
 
 
@@ -70,27 +71,33 @@ class JiraClient:
             print(f"Failed to update {epic_key}: {response.status_code} {response.text}")
 
 
-EPIC_KEY = "KAN-5"
+def main():
+    load_dotenv()
 
-# Load and parse the CSV data
-loader = CSVLoader("data.csv")
-data = loader.load()
-finder = ActivityFinder(data)
+    EPIC_KEY = "KAN-5"
 
-# Initialize the Jira client using credentials from the .env file
-jira = JiraClient(
-    base_url="https://tt-rtx-26.atlassian.net",
-    email=os.getenv("EMAIL"),
-    api_token=os.getenv("API_KEY"),
-)
+    loader = CSVLoader("data.csv")
+    data = loader.load()
+    finder = ActivityFinder(data)
 
-# Prompt the user and search for the activity
-key = input("Please enter a network activity name: ")
-hours = finder.find(key)
+    activity_name = input("Please enter a network activity name: ")
+    hours = finder.find(activity_name)
 
-# Update Jira if the activity was found, otherwise notify the user
-if hours is not None:
-    print(f"Activity {key} is worth {hours} hours.")
+    # Update Jira if the activity was found, otherwise notify the user
+    if hours is None:
+       print(f"Activity {activity_name} was not found in the given data.")
+       return
+    
+    print(f"Activity {activity_name} is worth {hours} hours.")
+
+    # Initialize the Jira client using credentials from the .env file
+    jira = JiraClient(
+       base_url="https://tt-rtx-26.atlassian.net",
+       email=os.getenv("EMAIL"),
+       api_token=os.getenv("API_KEY"),
+   )
     jira.update_epic_hours(EPIC_KEY, hours)
-else:
-    print(f"Activity {key} was not found in the given data.")
+
+
+if __name__ == "__main__":
+   main()
