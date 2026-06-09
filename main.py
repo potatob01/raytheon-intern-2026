@@ -1,92 +1,103 @@
-import csv
 import os
+import csv
 
 import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
 
-# Column positions within data.csv (0-indexed)
 NETWORK_ACTIVITY_COLUMN = 4
 HOURS_COLUMN = 7
 HEADER_ROW_COUNT = 2
 
 
-class ActivityRepository:
-    """Loads network activities from a CSV file and looks up their hours."""
+class CSVLoader:
+    """Handles reading and parsing a CSV file, skipping the first two header rows."""
 
-    def __init__(self, csv_path):
-        self.csv_path = csv_path
-        self._rows = self._load()
+    def __init__(self, filepath: str):
+        self.filepath = filepath
+        self.data = []
 
-    def _load(self):
-        with open(self.csv_path, "r", encoding="utf-8-sig", newline="") as file:
+    def load(self) -> list:
+        """Reads the CSV file and returns its contents as a 2D list."""
+        with open(self.filepath, "r", newline="") as file:
             reader = csv.reader(file)
-            rows = list(reader)
-        # Skip the two header rows that label each column.
-        return rows[HEADER_ROW_COUNT:]
+            for _ in range(HEADER_ROW_COUNT):
+                next(reader, None)
+            self.data = [row for row in reader]
+        return self.data
 
-    def find_hours(self, activity_name):
-        """Return the hours for an activity name, or None if not found."""
-        for row in self._rows:
-            if len(row) > HOURS_COLUMN and row[NETWORK_ACTIVITY_COLUMN] == activity_name:
-                return row[HOURS_COLUMN]
+
+class ActivityFinder:
+    """Searches parsed CSV data for a network activity by name."""
+
+    def __init__(self, data: list):
+        self.data = data
+
+    def find(self, key: str) -> str | None:
+        """Returns the hours for the given activity name, or None if not found."""
+        for line in self.data:
+            if line[NETWORK_ACTIVITY_COLUMN] == key:
+                return line[HOURS_COLUMN]
         return None
 
 
 class JiraClient:
-    """Minimal Jira REST client for updating an epic's Actual Hours field."""
+    """Handles communication with the Jira REST API."""
 
-    ACTUAL_HOURS_FIELD = "customfield_10104"
+    ACTUAL_HOURS_FIELD = "customfield_10104"  # Jira custom field ID for actual hours
 
-    def __init__(self, base_url, email, api_token):
-        self.base_url = base_url.rstrip("/")
+    def __init__(self, base_url: str, email: str, api_token: str):
+        self.base_url = base_url
         self.auth = HTTPBasicAuth(email, api_token)
+        self.headers = {
+            "Accept": "application/json",
+            "Content-Type": "application/json",
+        }
 
-    def update_epic_hours(self, epic_key, hours):
-        """Set the Actual Hours field on an epic. Returns True on success."""
+    def update_epic_hours(self, epic_key: str, value: float) -> None:
+        """Updates the Actual Hours custom field on a given Jira epic."""
         url = f"{self.base_url}/rest/api/3/issue/{epic_key}"
-        payload = {"fields": {self.ACTUAL_HOURS_FIELD: float(hours)}}
+        payload = {
+            "fields": {
+                self.ACTUAL_HOURS_FIELD: float(value)
+            }
+        }
+        response = requests.put(url, json=payload, auth=self.auth, headers=self.headers)
 
-        response = requests.put(
-            url,
-            json=payload,
-            auth=self.auth,
-            headers={
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            },
-        )
-
-        # A successful PUT to update an issue returns 204 No Content.
+        # A successful PUT to update an issue returns 204 No Content
         if response.status_code == 204:
-            print(f"Successfully set Actual Hours = {hours} on {epic_key}.")
-            return True
-
-        print(f"Failed to update {epic_key}: {response.status_code} {response.text}")
-        return False
+            print(f"Successfully set Actual Hours = {value} on {epic_key}.")
+        else:
+            print(f"Failed to update {epic_key}: {response.status_code} {response.text}")
 
 
 def main():
     load_dotenv()
 
-    repository = ActivityRepository("data.csv")
+    EPIC_KEY = "KAN-6"
+
+    loader = CSVLoader("data.csv")
+    data = loader.load()
+    finder = ActivityFinder(data)
 
     activity_name = input("Please enter a network activity name: ")
-    hours = repository.find_hours(activity_name)
+    hours = finder.find(activity_name)
 
+    # Update Jira if the activity was found, otherwise notify the user
     if hours is None:
-        print(f"Activity {activity_name} was not found in the given data.")
-        return
-
+       print(f"Activity {activity_name} was not found in the given data.")
+       return
+    
     print(f"Activity {activity_name} is worth {hours} hours.")
 
+    # Initialize the Jira client using credentials from the .env file
     jira = JiraClient(
-        base_url="https://tt-rtx-26.atlassian.net",
-        email=os.getenv("EMAIL"),
-        api_token=os.getenv("API_KEY"),
-    )
-    jira.update_epic_hours("KAN-5", hours)
+       base_url="https://tt-rtx-26.atlassian.net",
+       email=os.getenv("EMAIL"),
+       api_token=os.getenv("API_KEY"),
+   )
+    jira.update_epic_hours(EPIC_KEY, hours)
 
 
 if __name__ == "__main__":
-    main()
+   main()
