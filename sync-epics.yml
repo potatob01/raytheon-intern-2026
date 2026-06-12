@@ -1,0 +1,25 @@
+name: Sync Jira Epics
+
+on:
+  schedule:
+    - cron: "0 13 * * 1"   # every Monday 13:00 UTC
+  workflow_dispatch:
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Run sync
+        env:
+          EMAIL: ${{ secrets.JIRA_EMAIL }}
+          API_KEY: ${{ secrets.JIRA_API_KEY }}
+        run: python main.py
