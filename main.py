@@ -1,91 +1,132 @@
 import os
-import csv
 import re
+import json
+import logging
+from datetime import datetime, timezone
 
 import requests
 from requests.auth import HTTPBasicAuth
 from dotenv import load_dotenv
+from openpyxl import load_workbook
 
 NETWORK_ACTIVITY_COLUMN = 4
 HOURS_COLUMN = 7
 HEADER_ROW_COUNT = 2
+MAX_HOURS = 100_000
 
 JIRA_BASE_URL = "https://tt-rtx-26.atlassian.net"
 PROJECT_KEY = "KAN"
 EPIC_ISSUE_TYPE = "Epic"
-
 EPIC_NAME_PATTERN = re.compile(r"^Epic (\d+)$")
 
+SNAPSHOT_FILE = "snapshot.json"
+EXCEL_FILE = "data.xlsx"
 
-class CSVLoader:
-    """Handles reading and parsing a CSV file, skipping the first two header rows."""
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(levelname)s %(message)s",
+    datefmt="%Y-%m-%dT%H:%M:%S",
+)
+log = logging.getLogger(__name__)
 
-    def __init__(self, filepath: str):
+
+class ExcelLoader:
+    """Loads spreadsheet rows from a committed .xlsx file using openpyxl."""
+
+    def __init__(self, filepath: str = EXCEL_FILE):
         self.filepath = filepath
-        self.data = []
 
     def load(self) -> list:
-        """Reads the CSV file and returns its contents as a 2D list."""
-        with open(self.filepath, "r", newline="") as file:
-            reader = csv.reader(file)
-            for _ in range(HEADER_ROW_COUNT):
-                next(reader, None)
-            self.data = [row for row in reader]
-        return self.data
+        """Returns rows as a 2D list of strings, skipping the two header rows."""
+        wb = load_workbook(self.filepath, read_only=True, data_only=True)
+        ws = wb.active
+        rows = []
+        for row in ws.iter_rows(min_row=HEADER_ROW_COUNT + 1, values_only=True):
+            rows.append([str(cell) if cell is not None else "" for cell in row])
+        wb.close()
+        return rows
+
+
+class SnapshotManager:
+    """Persists last-synced state to a JSON file for change detection across runs."""
+
+    def __init__(self, filepath: str = SNAPSHOT_FILE):
+        self.filepath = filepath
+
+    def load(self) -> dict:
+        """Returns saved activity states, or empty dict on first run."""
+        if not os.path.exists(self.filepath):
+            return {}
+        with open(self.filepath, "r") as f:
+            return json.load(f).get("activities", {})
+
+    def save(self, activities: dict) -> None:
+        with open(self.filepath, "w") as f:
+            json.dump({"last_sync": datetime.now(timezone.utc).isoformat(), "activities": activities}, f, indent=2)
+        log.info(f"Snapshot saved ({len(activities)} activities).")
+
+
+class Validator:
+    """Validates a spreadsheet row before it is synced to Jira."""
+
+    def validate(self, activity: str, raw_hours: str) -> tuple[bool, str]:
+        """Returns (True, '') if valid, or (False, reason) otherwise."""
+        if not activity:
+            return False, "missing activity name"
+        if not raw_hours:
+            return False, f"missing hours for '{activity}'"
+        try:
+            hours = float(raw_hours)
+        except ValueError:
+            return False, f"non-numeric hours '{raw_hours}' for '{activity}'"
+        if hours < 0:
+            return False, f"negative hours {hours} for '{activity}'"
+        if hours > MAX_HOURS:
+            return False, f"hours {hours} exceeds maximum {MAX_HOURS} for '{activity}'"
+        return True, ""
 
 
 class ActivityFinder:
-    """Extracts network-activity-to-hours pairs from parsed CSV data."""
+    """Extracts a validated {network activity: hours} mapping from raw spreadsheet rows."""
 
     def __init__(self, data: list):
         self.data = data
+        self._validator = Validator()
 
     def unique_activities(self) -> dict:
-        """Returns an ordered mapping of {network activity: hours}.
-
-        Rows without a network activity name are skipped. When the same
-        activity appears more than once, the first occurrence wins.
-        """
+        """Returns an ordered dict of valid activities. First occurrence wins for duplicates."""
         activities = {}
         for line in self.data:
-            # Guard against short/ragged rows in the CSV.
             if len(line) <= max(NETWORK_ACTIVITY_COLUMN, HOURS_COLUMN):
                 continue
 
             name = line[NETWORK_ACTIVITY_COLUMN].strip()
-            if not name or name in activities:
+            if name in activities:
                 continue
 
             raw_hours = line[HOURS_COLUMN].strip()
-            try:
-                hours = float(raw_hours) if raw_hours else 0.0
-            except ValueError:
-                hours = 0.0
+            valid, reason = self._validator.validate(name, raw_hours)
+            if not valid:
+                log.warning(f"Skipping invalid row: {reason}.")
+                continue
 
-            activities[name] = hours
+            activities[name] = float(raw_hours)
         return activities
 
 
 class JiraClient:
     """Handles communication with the Jira REST API."""
 
-    ACTUAL_HOURS_FIELD = "customfield_10104"      # Jira custom field ID for actual hours
-    NETWORK_ACTIVITY_FIELD = "customfield_10105"  # Jira custom field ID for network activity
+    ACTUAL_HOURS_FIELD = "customfield_10104"
+    NETWORK_ACTIVITY_FIELD = "customfield_10105"
 
     def __init__(self, base_url: str, email: str, api_token: str):
         self.base_url = base_url
         self.auth = HTTPBasicAuth(email, api_token)
-        self.headers = {
-            "Accept": "application/json",
-            "Content-Type": "application/json",
-        }
+        self.headers = {"Accept": "application/json", "Content-Type": "application/json"}
 
     def get_epics(self, project_key: str) -> list:
-        """Returns all epics in the project as a list of dicts.
-
-        Each dict contains: key, summary, network_activity, hours.
-        Handles token-based pagination of the Jira search API.
-        """
+        """Returns all epics in the project with their custom field values."""
         url = f"{self.base_url}/rest/api/3/search/jql"
         jql = f"project = {project_key} AND issuetype = {EPIC_ISSUE_TYPE}"
         fields = ["summary", self.NETWORK_ACTIVITY_FIELD, self.ACTUAL_HOURS_FIELD]
@@ -99,17 +140,17 @@ class JiraClient:
 
             response = requests.post(url, json=payload, auth=self.auth, headers=self.headers)
             if response.status_code != 200:
-                print(f"Failed to fetch epics: {response.status_code} {response.text}")
+                log.error(f"Failed to fetch epics: {response.status_code} {response.text}")
                 break
 
             body = response.json()
             for issue in body.get("issues", []):
-                issue_fields = issue.get("fields", {})
+                f = issue.get("fields", {})
                 epics.append({
                     "key": issue["key"],
-                    "summary": issue_fields.get("summary"),
-                    "network_activity": issue_fields.get(self.NETWORK_ACTIVITY_FIELD),
-                    "hours": issue_fields.get(self.ACTUAL_HOURS_FIELD),
+                    "summary": f.get("summary"),
+                    "network_activity": f.get(self.NETWORK_ACTIVITY_FIELD),
+                    "hours": f.get(self.ACTUAL_HOURS_FIELD),
                 })
 
             if body.get("isLast", True):
@@ -123,25 +164,21 @@ class JiraClient:
     def create_epic(self, project_key: str, summary: str) -> str | None:
         """Creates a new epic and returns its key, or None on failure."""
         url = f"{self.base_url}/rest/api/3/issue"
-        payload = {
-            "fields": {
-                "project": {"key": project_key},
-                "issuetype": {"name": EPIC_ISSUE_TYPE},
-                "summary": summary,
-            }
-        }
+        payload = {"fields": {
+            "project": {"key": project_key},
+            "issuetype": {"name": EPIC_ISSUE_TYPE},
+            "summary": summary,
+        }}
         response = requests.post(url, json=payload, auth=self.auth, headers=self.headers)
-
         if response.status_code == 201:
             key = response.json()["key"]
-            print(f"Created epic {key} ({summary}).")
+            log.info(f"Created epic {key} ({summary}).")
             return key
-
-        print(f"Failed to create epic '{summary}': {response.status_code} {response.text}")
+        log.error(f"Failed to create epic '{summary}': {response.status_code} {response.text}")
         return None
 
     def update_epic_fields(self, epic_key: str, hours: float = None, network_activity: str = None) -> bool:
-        """Updates the hours and/or network activity custom fields on an epic."""
+        """Updates Actual Hours and/or Network Activity on an epic."""
         fields = {}
         if hours is not None:
             fields[self.ACTUAL_HOURS_FIELD] = float(hours)
@@ -151,35 +188,31 @@ class JiraClient:
         if not fields:
             return True
 
-        url = f"{self.base_url}/rest/api/3/issue/{epic_key}"
-        response = requests.put(url, json={"fields": fields}, auth=self.auth, headers=self.headers)
-
-        # A successful PUT to update an issue returns 204 No Content
+        response = requests.put(
+            f"{self.base_url}/rest/api/3/issue/{epic_key}",
+            json={"fields": fields}, auth=self.auth, headers=self.headers,
+        )
         if response.status_code == 204:
-            updated = ", ".join(f"{k}={v}" for k, v in [("Network Activity", network_activity), ("Actual Hours", hours)] if v is not None)
-            print(f"Updated {epic_key}: {updated}.")
+            parts = ([f"Network Activity={network_activity}"] if network_activity else []) + \
+                    ([f"Actual Hours={hours}"] if hours is not None else [])
+            log.info(f"Updated {epic_key}: {', '.join(parts)}.")
             return True
-
-        print(f"Failed to update {epic_key}: {response.status_code} {response.text}")
+        log.error(f"Failed to update {epic_key}: {response.status_code} {response.text}")
         return False
 
 
 def next_epic_number(epics: list) -> int:
-    """Returns the next available number for the 'Epic <n>' naming scheme."""
     highest = 0
     for epic in epics:
-        match = EPIC_NAME_PATTERN.match((epic.get("summary") or "").strip())
-        if match:
-            highest = max(highest, int(match.group(1)))
+        m = EPIC_NAME_PATTERN.match((epic.get("summary") or "").strip())
+        if m:
+            highest = max(highest, int(m.group(1)))
     return highest + 1
 
 
-def hours_match(existing, new) -> bool:
-    """Returns True if the epic's current hours already equal the new value."""
-    if existing is None:
-        return False
+def hours_match(a, b) -> bool:
     try:
-        return float(existing) == float(new)
+        return float(a) == float(b)
     except (TypeError, ValueError):
         return False
 
@@ -187,13 +220,13 @@ def hours_match(existing, new) -> bool:
 def main():
     load_dotenv()
 
-    loader = CSVLoader("data.csv")
+    loader = ExcelLoader()
     data = loader.load()
     finder = ActivityFinder(data)
     activities = finder.unique_activities()
 
     if not activities:
-        print("No network activities found in the data.")
+        log.info("No valid network activities found in the spreadsheet.")
         return
 
     jira = JiraClient(
@@ -202,39 +235,82 @@ def main():
         api_token=os.getenv("API_KEY"),
     )
 
-    # Index existing epics by their Network Activity field for quick lookup.
     epics = jira.get_epics(PROJECT_KEY)
-    epics_by_activity = {
-        epic["network_activity"]: epic
-        for epic in epics
-        if epic["network_activity"]
-    }
+    epics_by_activity = {e["network_activity"]: e for e in epics if e["network_activity"]}
     epic_counter = next_epic_number(epics)
 
-    print(f"Processing {len(activities)} network activities against {len(epics)} existing epics.\n")
+    snapshot_mgr = SnapshotManager()
+    snapshot = snapshot_mgr.load()
+    new_snapshot = dict(snapshot)
 
-    for activity, hours in activities.items():
+    conflicts = []
+
+    log.info(f"Processing {len(activities)} activities against {len(epics)} existing epics.")
+
+    for activity, sheet_hours in activities.items():
         existing = epics_by_activity.get(activity)
+        snap = snapshot.get(activity)
+        snap_hours = snap.get("hours") if snap else None
 
-        if existing:
-            # Epic already tracks this activity: only refresh its hours.
-            if hours_match(existing.get("hours"), hours):
-                print(f"{existing['key']} already up to date for '{activity}' ({hours} hours).")
-            else:
-                jira.update_epic_fields(existing["key"], hours=hours)
+        # ── New activity: create epic and populate both fields ──────────────
+        if not existing:
+            summary = f"Epic {epic_counter}"
+            epic_counter += 1
+            new_key = jira.create_epic(PROJECT_KEY, summary)
+            if new_key:
+                jira.update_epic_fields(new_key, hours=sheet_hours, network_activity=activity)
+                new_snapshot[activity] = {"hours": sheet_hours, "jira_key": new_key}
             continue
 
-        # No epic tracks this activity yet: create one and populate both fields.
-        summary = f"Epic {epic_counter}"
-        epic_counter += 1
+        jira_key = existing["key"]
+        jira_hours = existing.get("hours")
 
-        new_key = jira.create_epic(PROJECT_KEY, summary)
-        if new_key is None:
+        sheet_changed = snap_hours is None or not hours_match(snap_hours, sheet_hours)
+        # Jira-side change is only meaningful when we have a prior snapshot to compare against.
+        jira_changed = snap_hours is not None and not hours_match(snap_hours, jira_hours)
+
+        # ── True conflict: both sides diverged to different values ──────────
+        if sheet_changed and jira_changed and not hours_match(sheet_hours, jira_hours):
+            conflicts.append({
+                "epic": jira_key, "activity": activity,
+                "sheet": sheet_hours, "jira": jira_hours, "last_sync": snap_hours,
+            })
+            log.warning(
+                f"CONFLICT {jira_key} ('{activity}'): "
+                f"sheet={sheet_hours}, jira={jira_hours}, last_sync={snap_hours}. "
+                f"Skipping — resolve manually then re-run."
+            )
             continue
 
-        jira.update_epic_fields(new_key, hours=hours, network_activity=activity)
+        # ── Jira-side edit: Jira diverged while sheet stayed the same ───────
+        if jira_changed and not sheet_changed:
+            log.warning(
+                f"Jira-side edit on {jira_key} ('{activity}'): "
+                f"jira={jira_hours} (was {snap_hours}). "
+                f"Sheet unchanged at {sheet_hours} — restoring sheet value."
+            )
+            if jira.update_epic_fields(jira_key, hours=sheet_hours):
+                new_snapshot[activity] = {"hours": sheet_hours, "jira_key": jira_key}
+            continue
 
-    print("\nDone.")
+        # ── Sheet changed: normal sync ───────────────────────────────────────
+        if sheet_changed:
+            if jira.update_epic_fields(jira_key, hours=sheet_hours):
+                new_snapshot[activity] = {"hours": sheet_hours, "jira_key": jira_key}
+            continue
+
+        # ── Nothing changed ──────────────────────────────────────────────────
+        log.info(f"{jira_key} up to date for '{activity}' ({sheet_hours} hours).")
+        new_snapshot[activity] = {"hours": sheet_hours, "jira_key": jira_key}
+
+    snapshot_mgr.save(new_snapshot)
+
+    if conflicts:
+        log.warning(f"\n{len(conflicts)} unresolved conflict(s):")
+        for c in conflicts:
+            log.warning(f"  {c['epic']} ('{c['activity']}'): sheet={c['sheet']}, jira={c['jira']}, last_sync={c['last_sync']}")
+
+    log.info("Done.")
 
 
 if __name__ == "__main__":
